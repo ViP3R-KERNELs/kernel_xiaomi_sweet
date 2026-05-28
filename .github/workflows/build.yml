@@ -1,0 +1,119 @@
+name: Build ViP3R Sweet Kernel
+
+# This lets you trigger the build manually from the GitHub Actions tab
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - NETHUNTER  # also auto-builds when you push to main branch
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04  # GitHub gives you a free Linux VM
+    
+    steps:
+
+      # 1. Download your kernel source code into the VM
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # important: gets sub-repos too
+
+      # 2. Install all the Linux tools needed to compile a kernel
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 libelf-dev
+
+      # 3. Download the ARM64 cross-compiler (Clang from AOSP)
+      - name: Download Clang toolchain
+        run: |
+          mkdir -p $HOME/clang
+          cd $HOME/clang
+          # Using AOSP's prebuilt Clang — a reliable choice for Snapdragon kernels
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz
+          echo "CLANG_PATH=$HOME/clang/bin" >> $GITHUB_ENV
+
+      # Alternative: use proton-clang which many custom kernel devs prefer
+      # Uncomment the block below and comment out the block above if AOSP clang fails
+      # - name: Download Proton Clang
+      #   run: |
+      #     mkdir -p $HOME/proton-clang
+      #     git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/proton-clang
+      #     echo "CLANG_PATH=$HOME/proton-clang/bin" >> $GITHUB_ENV
+
+      # 4. Also get GCC for assembler tools Clang still depends on
+      - name: Download GCC toolchains
+        run: |
+          mkdir -p $HOME/gcc64 $HOME/gcc32
+          git clone --depth=1 https://github.com/mvaisakh/gcc-arm64 $HOME/gcc64
+          git clone --depth=1 https://github.com/mvaisakh/gcc-arm $HOME/gcc32
+
+      # 5. The actual compilation step — this is where the kernel is built
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=$HOME/gcc64/bin/aarch64-elf-
+          export CROSS_COMPILE_ARM32=$HOME/gcc32/bin/arm-eabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=$HOME/clang/bin/clang   # adjust path if using proton-clang
+          export PATH="$HOME/clang/bin:$HOME/gcc64/bin:$HOME/gcc32/bin:$PATH"
+          
+          # Load the device-specific config for Redmi Note 10 Pro (sweet)
+          # Check the arch/arm64/configs/ folder in the repo for the exact filename
+          make O=out ARCH=arm64 sweet_defconfig
+          # If that config name doesn't work, try: sweet_defconfig or sweetin_defconfig
+          
+          # Compile! -j$(nproc) uses all available CPU cores for speed
+          make -j$(nproc) O=out \
+            ARCH=arm64 \
+            CC=$HOME/clang/bin/clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=$HOME/gcc64/bin/aarch64-elf- \
+            CROSS_COMPILE_ARM32=$HOME/gcc32/bin/arm-eabi- \
+            Image.gz-dtb dtbo.img 2>&1 | tee build.log
+
+      # 6. Package the compiled kernel into a flashable zip using AnyKernel3
+      - name: Package kernel with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          
+          # Copy the compiled kernel image into the AnyKernel3 folder
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          
+          # Copy dtbo if it compiled (not all kernels need it, don't panic if missing)
+          cp out/arch/arm64/boot/dtbo.img AnyKernel3/ 2>/dev/null || true
+          
+          # Edit the AnyKernel3 config to target your device
+          cd AnyKernel3
+          sed -i 's/device.name1=.*/device.name1=sweet/' anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=sweetin/' anykernel.sh
+          
+          # Create the flashable zip
+          zip -r9 ../ViP3R-Sweet-Kernel-$(date +%Y%m%d).zip * -x "*.git*"
+
+      # 7. Upload the zip as a downloadable artifact
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ViP3R-Sweet-Kernel
+          path: ViP3R-Sweet-Kernel-*.zip
+          retention-days: 30  # GitHub keeps it for 30 days
+
+      # Optional: also upload the build log so you can debug if anything went wrong
+      - name: Upload build log
+        if: always()  # upload log even if build failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
